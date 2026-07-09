@@ -224,6 +224,30 @@ func TestSQLiteStoreSeedsDefaultModelPricesWithoutOverridingManualPrices(t *test
 	for _, price := range prices {
 		priceByModel[price.Model] = price
 	}
+	gpt56Cases := []struct {
+		model         string
+		input         float64
+		output        float64
+		cacheRead     float64
+		cacheCreation float64
+	}{
+		{model: "gpt-5.6-sol", input: 5, output: 30, cacheRead: 0.5, cacheCreation: 6.25},
+		{model: "gpt-5.6-terra", input: 2.5, output: 15, cacheRead: 0.25, cacheCreation: 3.125},
+		{model: "gpt-5.6-luna", input: 1, output: 6, cacheRead: 0.1, cacheCreation: 1.25},
+	}
+	for _, testCase := range gpt56Cases {
+		price, ok := priceByModel[testCase.model]
+		if !ok {
+			t.Fatalf("expected %s default price, got %#v", testCase.model, prices)
+		}
+		if price.InputPer1M != testCase.input || price.OutputPer1M != testCase.output ||
+			price.CacheReadPer1M != testCase.cacheRead || price.CacheCreationPer1M != testCase.cacheCreation {
+			t.Fatalf("%s default price = %#v", testCase.model, price)
+		}
+		if price.Source != gpt56PricingSource {
+			t.Fatalf("%s source = %q", testCase.model, price.Source)
+		}
+	}
 	kimi, ok := priceByModel["kimi-k2.6"]
 	if !ok {
 		t.Fatalf("expected kimi-k2.6 default price, got %#v", prices)

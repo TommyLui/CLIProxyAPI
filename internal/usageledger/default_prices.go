@@ -1,10 +1,16 @@
 package usageledger
 
-const defaultModelPriceSource = "opencode-zen-default"
+const (
+	defaultModelPriceSource = "opencode-zen-default"
+	gpt56PricingSource      = "https://openai.com/zh-Hans-CN/index/previewing-gpt-5-6-sol/#ke-yong-xing-yu-ding-jie"
+)
 
 func defaultModelPrices() []ModelPrice {
 	prices := []ModelPrice{
 		// OpenCode Zen / GPT and Codex models.
+		pricedFrom("gpt-5.6-sol", 5, 30, 0.5, 6.25, gpt56PricingSource, "gpt-5.6-sol", "2026-06-26T00:00:00Z"),
+		pricedFrom("gpt-5.6-terra", 2.5, 15, 0.25, 3.125, gpt56PricingSource, "gpt-5.6-terra", "2026-06-26T00:00:00Z"),
+		pricedFrom("gpt-5.6-luna", 1, 6, 0.1, 1.25, gpt56PricingSource, "gpt-5.6-luna", "2026-06-26T00:00:00Z"),
 		defaultPrice("gpt-5.5", 5, 30, 0.5, 0, "gpt-5.5"),
 		defaultPrice("gpt-5.5-pro", 30, 180, 30, 0, "gpt-5.5-pro"),
 		defaultPrice("gpt-5.4", 2.5, 15, 0.25, 0, "gpt-5.4"),
@@ -60,6 +66,19 @@ func defaultModelPrices() []ModelPrice {
 }
 
 func defaultPrice(model string, input, output, cacheRead, cacheCreation float64, sourceModelID string) ModelPrice {
+	return pricedFrom(
+		model,
+		input,
+		output,
+		cacheRead,
+		cacheCreation,
+		defaultModelPriceSource,
+		sourceModelID,
+		"2026-06-25T00:00:00Z",
+	)
+}
+
+func pricedFrom(model string, input, output, cacheRead, cacheCreation float64, source, sourceModelID, updatedAt string) ModelPrice {
 	return ModelPrice{
 		Model:              model,
 		InputPer1M:         input,
@@ -67,9 +86,9 @@ func defaultPrice(model string, input, output, cacheRead, cacheCreation float64,
 		CacheReadPer1M:     cacheRead,
 		CacheCreationPer1M: cacheCreation,
 		CachedPer1M:        cacheRead,
-		Source:             defaultModelPriceSource,
+		Source:             source,
 		SourceModelID:      sourceModelID,
-		UpdatedAt:          "2026-06-25T00:00:00Z",
+		UpdatedAt:          updatedAt,
 	}
 }
 

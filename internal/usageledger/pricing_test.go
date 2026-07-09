@@ -86,6 +86,30 @@ func TestCostForUsageMatchesWildcardAfterExact(t *testing.T) {
 	}
 }
 
+func TestCostForUsageMatchesReasoningSuffixToBaseModel(t *testing.T) {
+	prices := []usageledger.ModelPrice{{
+		Model:              "gpt-5.6-sol",
+		InputPer1M:         5,
+		OutputPer1M:        30,
+		CacheReadPer1M:     0.5,
+		CacheCreationPer1M: 6.25,
+	}}
+	tokens := usageledger.TokenUsage{
+		InputTokens:         3_000_000,
+		OutputTokens:        1_000_000,
+		CacheReadTokens:     1_000_000,
+		CacheCreationTokens: 1_000_000,
+	}
+
+	cost, ok, missing := usageledger.CostForUsage("gpt-5.6-sol(xhigh)", tokens, prices)
+	if !ok || len(missing) != 0 {
+		t.Fatalf("reasoning-suffix cost missing: ok=%v missing=%v", ok, missing)
+	}
+	if cost != 41.75 {
+		t.Fatalf("reasoning-suffix cost = %v, want 41.75", cost)
+	}
+}
+
 func TestCostForUsageMissingPrice(t *testing.T) {
 	cost, ok, missing := usageledger.CostForUsage(
 		"missing-model",

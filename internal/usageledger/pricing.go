@@ -39,8 +39,11 @@ func MatchModelPrice(model string, prices []ModelPrice) (ModelPrice, bool) {
 	if model == "" {
 		return ModelPrice{}, false
 	}
-	for _, price := range prices {
-		if strings.EqualFold(strings.TrimSpace(price.Model), model) {
+	if price, ok := matchExactModelPrice(model, prices); ok {
+		return price, true
+	}
+	if baseModel := modelWithoutReasoningSuffix(model); baseModel != model {
+		if price, ok := matchExactModelPrice(baseModel, prices); ok {
 			return price, true
 		}
 	}
@@ -55,6 +58,23 @@ func MatchModelPrice(model string, prices []ModelPrice) (ModelPrice, bool) {
 		}
 	}
 	return ModelPrice{}, false
+}
+
+func matchExactModelPrice(model string, prices []ModelPrice) (ModelPrice, bool) {
+	for _, price := range prices {
+		if strings.EqualFold(strings.TrimSpace(price.Model), model) {
+			return price, true
+		}
+	}
+	return ModelPrice{}, false
+}
+
+func modelWithoutReasoningSuffix(model string) string {
+	open := strings.LastIndex(model, "(")
+	if open <= 0 || !strings.HasSuffix(model, ")") {
+		return model
+	}
+	return strings.TrimSpace(model[:open])
 }
 
 func maxInt64(value, minimum int64) int64 {
