@@ -22,6 +22,7 @@ func (h *Handler) PostUsageAnalytics(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid analytics request"})
 		return
 	}
+	req.ModelAliases = h.usageAnalyticsModelAliases()
 	resp, err := store.Analytics(c.Request.Context(), req)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
