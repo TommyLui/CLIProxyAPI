@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/usageledger"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 )
 
 type usageAnalyticsAliasFallback struct {
@@ -39,7 +40,7 @@ func (h *Handler) usageAnalyticsModelAliases() []usageledger.ModelAliasRule {
 
 	fallbacks := make(map[string]*usageAnalyticsAliasFallback)
 	for _, entry := range entries {
-		provider := "openai-compatible-" + strings.ToLower(strings.TrimSpace(entry.Name))
+		provider := util.OpenAICompatibleProviderKey(entry.Name)
 		authIndexes := usageAnalyticsCompatibilityAuthIndexes(entry)
 		for _, model := range entry.Models {
 			upstreamModel := strings.TrimSpace(model.Name)

@@ -260,6 +260,129 @@ func TestUsageAnalyticsModelAliasesUseAuthIndexesAndOnlyUnambiguousFallbacks(t *
 	}
 }
 
+func TestUsageAnalyticsModelAliasesUseRuntimeCompatibleProviderKeys(t *testing.T) {
+	tests := []struct {
+		name         string
+		providerName string
+		wantProvider string
+	}{
+		{name: "empty name", providerName: "", wantProvider: "openai-compatibility"},
+		{name: "default compatibility name", providerName: "openai-compatibility", wantProvider: "openai-compatibility"},
+		{name: "already compatible prefix", providerName: "openai-compatible-cf worker", wantProvider: "openai-compatible-cf worker"},
+		{name: "plain compatibility name", providerName: "cf worker", wantProvider: "openai-compatible-cf worker"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			h := NewHandlerWithoutConfigFilePath(&config.Config{
+				AuthDir: t.TempDir(),
+				OpenAICompatibility: []config.OpenAICompatibility{{
+					Name: test.providerName,
+					Models: []config.OpenAICompatibilityModel{{
+						Name:  "upstream-model",
+						Alias: "configured-alias",
+					}},
+				}},
+			}, nil)
+
+			rules := h.usageAnalyticsModelAliases()
+			if len(rules) != 1 {
+				t.Fatalf("rules = %#v, want one provider fallback", rules)
+			}
+			if rules[0].Provider != test.wantProvider {
+				t.Fatalf("provider = %q, want %q", rules[0].Provider, test.wantProvider)
+			}
+		})
+	}
+}
+
+func TestUsageAnalyticsEndpointResolvesAliasUsingProviderAuthIndexWithoutAPIKeyEntries(t *testing.T) {
+	store := openManagementUsageStore(t)
+	const provider = "openai-compatibility"
+	const upstream = "provider-auth-upstream"
+	const alias = "provider-auth-alias"
+	const baseURL = "https://provider-auth.example/v1"
+
+	idGen := synthesizer.NewStableIDGenerator()
+	authID, _ := idGen.Next("openai-compatibility:openai-compatibility", baseURL)
+	manager := coreauth.NewManager(nil, nil, nil)
+	auth := &coreauth.Auth{ID: authID, Provider: provider}
+	authIndex := auth.EnsureIndex()
+	if _, err := manager.Register(context.Background(), auth); err != nil {
+		t.Fatalf("register auth: %v", err)
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{
+		AuthDir: t.TempDir(),
+		OpenAICompatibility: []config.OpenAICompatibility{{
+			BaseURL: baseURL,
+			Models: []config.OpenAICompatibilityModel{{
+				Name:  upstream,
+				Alias: alias,
+			}},
+		}},
+	}, manager)
+	h.SetUsageLedger(store)
+	router := usageManagementTestRouter(h)
+
+	now := time.Date(2026, 7, 10, 3, 0, 0, 0, time.UTC)
+	if err := store.UpsertModelPrice(context.Background(), usageledger.ModelPrice{
+		Model:       alias,
+		InputPer1M:  10,
+		OutputPer1M: 20,
+		Source:      "test",
+	}); err != nil {
+		t.Fatalf("upsert alias price: %v", err)
+	}
+	if _, err := store.InsertEvent(context.Background(), usageledger.Event{
+		RequestID: "req-provider-auth-alias",
+		Timestamp: now,
+		Provider:  provider,
+		Model:     upstream,
+		AuthIndex: authIndex,
+		Tokens: usageledger.TokenUsage{
+			InputTokens:  100,
+			OutputTokens: 50,
+			TotalTokens:  150,
+		},
+	}); err != nil {
+		t.Fatalf("insert historical event: %v", err)
+	}
+
+	rec := performUsageManagementJSON(http.MethodPost, "/v0/management/usage-analytics", map[string]any{
+		"from_ms": now.Add(-time.Minute).UnixMilli(),
+		"to_ms":   now.Add(time.Minute).UnixMilli(),
+		"include": map[string]any{
+			"model_stats": true,
+			"events_page": map[string]any{"limit": 5},
+		},
+	}, router)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("analytics status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+
+	var response usageledger.AnalyticsResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode analytics: %v", err)
+	}
+	if len(response.ModelStats) != 1 || response.ModelStats[0].Model != alias {
+		t.Fatalf("model stats = %#v", response.ModelStats)
+	}
+	if response.ModelStats[0].Cost == nil || math.Abs(*response.ModelStats[0].Cost-0.002) > 0.000000001 {
+		t.Fatalf("model stat cost = %#v, want 0.002", response.ModelStats[0].Cost)
+	}
+	if response.Events == nil || len(response.Events.Items) != 1 {
+		t.Fatalf("events = %#v", response.Events)
+	}
+	event := response.Events.Items[0]
+	if event.Model != alias || event.UpstreamModel != upstream {
+		t.Fatalf("event model = %q, upstream model = %q", event.Model, event.UpstreamModel)
+	}
+	if event.EstimatedCostUSD == nil || math.Abs(*event.EstimatedCostUSD-0.002) > 0.000000001 {
+		t.Fatalf("event cost = %#v, want 0.002", event.EstimatedCostUSD)
+	}
+}
+
 func TestUsageAnalyticsEndpointUsesAuthIndexAndDoesNotGuessConflictingFallback(t *testing.T) {
 	store := openManagementUsageStore(t)
 	const provider = "openai-compatible-cf worker"
