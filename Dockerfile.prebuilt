@@ -1,10 +1,12 @@
-FROM alpine:3.22
+FROM debian:bookworm-slim
 
-RUN apk add --no-cache ca-certificates tzdata
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates tzdata && \
+    rm -rf /var/lib/apt/lists/*
 
 RUN mkdir -p /CLIProxyAPI
 
-COPY release/cli-proxy-api-linux-amd64-no-plugin /CLIProxyAPI/CLIProxyAPI
+COPY release/cli-proxy-api-linux-amd64 /CLIProxyAPI/CLIProxyAPI
 COPY config.example.yaml /CLIProxyAPI/config.example.yaml
 
 WORKDIR /CLIProxyAPI

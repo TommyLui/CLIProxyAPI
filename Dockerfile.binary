@@ -1,21 +1,32 @@
-FROM golang:1.26-bookworm AS builder
+ARG MANYLINUX_IMAGE=quay.io/pypa/manylinux2014_x86_64
+FROM ${MANYLINUX_IMAGE} AS builder
 
 WORKDIR /src
+
+ARG GO_VERSION=1.26.4
+ARG VERSION=dev
+ARG COMMIT=none
+ARG BUILD_DATE=unknown
+ARG TARGETOS=linux
+ARG TARGETARCH=amd64
+ARG CGO_ENABLED=1
+ARG OUTPUT_SUFFIX=
+
+RUN go_archive="go${GO_VERSION}.linux-${TARGETARCH}.tar.gz" && \
+    curl -fsSL "https://go.dev/dl/${go_archive}" -o "/tmp/${go_archive}" && \
+    rm -rf /usr/local/go && \
+    tar -C /usr/local -xzf "/tmp/${go_archive}"
+
+ENV PATH="/usr/local/go/bin:${PATH}"
 
 COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
 
-ARG VERSION=dev
-ARG COMMIT=none
-ARG BUILD_DATE=unknown
-ARG TARGETOS=linux
-ARG TARGETARCH=amd64
-
-RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -buildvcs=false \
+RUN CGO_ENABLED=${CGO_ENABLED} GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -buildvcs=false \
     -ldflags="-s -w -X main.Version=${VERSION} -X main.Commit=${COMMIT} -X main.BuildDate=${BUILD_DATE}" \
-    -o /out/cli-proxy-api-${TARGETOS}-${TARGETARCH}-no-plugin ./cmd/server/
+    -o /out/cli-proxy-api-${TARGETOS}-${TARGETARCH}${OUTPUT_SUFFIX} ./cmd/server/
 
 FROM scratch AS export
 COPY --from=builder /out/ /
