@@ -1,0 +1,18 @@
+FROM alpine:3.22
+
+RUN apk add --no-cache ca-certificates tzdata
+
+RUN mkdir -p /CLIProxyAPI
+
+COPY release/cli-proxy-api-linux-amd64-no-plugin /CLIProxyAPI/CLIProxyAPI
+COPY config.example.yaml /CLIProxyAPI/config.example.yaml
+
+WORKDIR /CLIProxyAPI
+
+EXPOSE 8317
+
+ENV TZ=Asia/Shanghai
+
+RUN chmod +x /CLIProxyAPI/CLIProxyAPI
+
+CMD ["./CLIProxyAPI"]
