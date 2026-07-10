@@ -118,6 +118,36 @@ func TestSQLiteStoreAnalyticsAggregatesFilteredUsage(t *testing.T) {
 	}
 }
 
+func TestSQLiteStoreAnalyticsEventsReadsModelAlias(t *testing.T) {
+	store := openTestStore(t)
+	defer store.Close()
+
+	now := time.Date(2026, 7, 10, 1, 0, 0, 0, time.UTC)
+	if _, err := store.InsertEvent(context.Background(), Event{
+		RequestID:  "req-model-alias-readback",
+		Timestamp:  now,
+		Provider:   "openai-compatible-cf worker",
+		Model:      "@cf/zai-org/glm-5.2",
+		ModelAlias: "glm-5.2",
+	}); err != nil {
+		t.Fatalf("insert event: %v", err)
+	}
+
+	events, err := store.analyticsEvents(context.Background(), AnalyticsRequest{
+		FromMS: now.Add(-time.Minute).UnixMilli(),
+		ToMS:   now.Add(time.Minute).UnixMilli(),
+	}, nil)
+	if err != nil {
+		t.Fatalf("analytics events: %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("events = %#v, want one event", events)
+	}
+	if got := events[0].event.ModelAlias; got != "glm-5.2" {
+		t.Fatalf("model alias = %q, want glm-5.2", got)
+	}
+}
+
 func TestSQLiteStoreAnalyticsReturnsKnownCostWhenSomeModelsAreUnpriced(t *testing.T) {
 	store := openTestStore(t)
 	defer store.Close()
