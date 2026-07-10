@@ -84,6 +84,26 @@ func TestExtractReasoningEffortOpenAICompatiblePayloads(t *testing.T) {
 	}
 }
 
+func TestExtractReasoningEffortOpenAICompatibleFieldPriority(t *testing.T) {
+	body := []byte(`{"reasoning_effort":"low","reasoning":{"effort":"high"}}`)
+	tests := []struct {
+		name     string
+		provider string
+		want     string
+	}{
+		{name: "chat completions prefers top level effort", provider: "openai", want: "low"},
+		{name: "responses prefers nested effort", provider: "openai-response", want: "high"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := ExtractReasoningEffort(body, tt.provider, "gpt-5.4"); got != tt.want {
+				t.Fatalf("ExtractReasoningEffort() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestExtractTranslatedReasoningEffortOpenAICompatibleFallback(t *testing.T) {
 	if got := ExtractTranslatedReasoningEffort(
 		[]byte(`{"thinking":{"type":"adaptive"},"output_config":{"effort":"max"}}`),

@@ -443,7 +443,15 @@ func ExtractReasoningEffort(body []byte, provider, model string) string {
 	provider = strings.ToLower(strings.TrimSpace(provider))
 	var config ThinkingConfig
 	switch provider {
-	case "openai", "openai-response":
+	case "openai":
+		config = extractOpenAIConfig(body)
+		if !hasThinkingConfig(config) {
+			config = extractCodexConfig(body)
+		}
+		if !hasThinkingConfig(config) {
+			config = extractClaudeConfig(body)
+		}
+	case "openai-response":
 		config = extractCodexConfig(body)
 		if !hasThinkingConfig(config) {
 			config = extractOpenAIConfig(body)
