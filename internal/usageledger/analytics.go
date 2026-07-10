@@ -12,14 +12,15 @@ const defaultAnalyticsEventsLimit = 100
 const maxAnalyticsEventsLimit = 50000
 
 type analyticsEvent struct {
-	id       int64
-	event    Event
-	tokens   TokenUsage
-	cost     float64
-	hasCost  bool
-	missing  string
-	failed   bool
-	unixNano int64
+	id            int64
+	event         Event
+	upstreamModel string
+	tokens        TokenUsage
+	cost          float64
+	hasCost       bool
+	missing       string
+	failed        bool
+	unixNano      int64
 }
 
 type analyticsAggregate struct {
@@ -154,6 +155,8 @@ func (s *SQLiteStore) analyticsEvents(ctx context.Context, req AnalyticsRequest,
 		item.tokens = item.event.Tokens
 		item.failed = failed != 0
 		item.event.Failed = item.failed
+		item.upstreamModel = strings.TrimSpace(item.event.Model)
+		item.event.Model = resolveAnalyticsModel(item.event, req.ModelAliases)
 		if cost, ok, missing := CostForUsage(item.event.Model, item.tokens, prices); ok {
 			item.cost = cost
 			item.hasCost = true
@@ -184,7 +187,7 @@ func buildAnalyticsWhere(req AnalyticsRequest) (string, []any) {
 		clauses = append(clauses, column+" IN ("+strings.Join(placeholders, ",")+")")
 	}
 	addIn("provider", req.Filters.Providers)
-	addIn("model", req.Filters.Models)
+	addAnalyticsModelFilter(req.Filters.Models, req.ModelAliases, &clauses, &args)
 	addIn("auth_file_name", req.Filters.AuthFiles)
 	addIn("auth_index", req.Filters.AuthIndices)
 	addAPIKeyHashFilter(req.Filters.APIKeyHashes, &clauses, &args)
@@ -195,6 +198,36 @@ func buildAnalyticsWhere(req AnalyticsRequest) (string, []any) {
 		clauses = append(clauses, "failed = 0")
 	}
 	return "WHERE " + strings.Join(clauses, " AND "), args
+}
+
+func addAnalyticsModelFilter(values []string, rules []ModelAliasRule, clauses *[]string, args *[]any) {
+	requested := cleanedAnalyticsValues(values)
+	if len(requested) == 0 || clauses == nil || args == nil {
+		return
+	}
+	modelCandidates := append([]string{}, requested...)
+	for _, rule := range rules {
+		if !isModelAliasRule(rule) {
+			continue
+		}
+		for _, model := range requested {
+			if strings.EqualFold(strings.TrimSpace(rule.Alias), model) {
+				modelCandidates = appendUniqueModelAlias(modelCandidates, strings.TrimSpace(rule.UpstreamModel))
+				break
+			}
+		}
+	}
+	aliasPlaceholders := make([]string, len(requested))
+	for i, value := range requested {
+		aliasPlaceholders[i] = "?"
+		*args = append(*args, value)
+	}
+	modelPlaceholders := make([]string, len(modelCandidates))
+	for i, value := range modelCandidates {
+		modelPlaceholders[i] = "?"
+		*args = append(*args, value)
+	}
+	*clauses = append(*clauses, "(model_alias COLLATE NOCASE IN ("+strings.Join(aliasPlaceholders, ",")+") OR model COLLATE NOCASE IN ("+strings.Join(modelPlaceholders, ",")+"))")
 }
 
 func addAPIKeyHashFilter(values []string, clauses *[]string, args *[]any) {
@@ -558,6 +591,9 @@ func buildAnalyticsEventsPage(events []analyticsEvent, page AnalyticsEventsPage)
 			Tokens:                event.tokens,
 			Failed:                event.failed,
 			MissingPriceModelName: event.missing,
+		}
+		if event.upstreamModel != "" && event.upstreamModel != event.event.Model {
+			row.UpstreamModel = event.upstreamModel
 		}
 		if event.hasCost {
 			row.EstimatedCostUSD = floatPtr(event.cost)

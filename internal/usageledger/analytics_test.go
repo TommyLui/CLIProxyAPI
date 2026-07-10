@@ -148,6 +148,208 @@ func TestSQLiteStoreAnalyticsEventsReadsModelAlias(t *testing.T) {
 	}
 }
 
+func TestSQLiteStoreAnalyticsResolveAliasRules(t *testing.T) {
+	rules := []ModelAliasRule{
+		{
+			Provider:      "openai-compatible-cf worker",
+			AuthIndex:     "auth-cf",
+			UpstreamModel: "@cf/zai-org/glm-5.2",
+			Alias:         "glm-5.2",
+		},
+		{
+			Provider:      "openai-compatible-cf worker",
+			AuthIndex:     "auth-other",
+			UpstreamModel: "@cf/zai-org/glm-5.2",
+			Alias:         "glm-5.2-other",
+		},
+	}
+
+	tests := []struct {
+		name  string
+		event Event
+		rules []ModelAliasRule
+		want  string
+	}{
+		{
+			name: "stored alias wins",
+			event: Event{
+				Provider:   "openai-compatible-cf worker",
+				AuthIndex:  "auth-cf",
+				Model:      "@cf/zai-org/glm-5.2",
+				ModelAlias: "stored-glm-5.2",
+			},
+			rules: rules,
+			want:  "stored-glm-5.2",
+		},
+		{
+			name: "exact mapping is case insensitive",
+			event: Event{
+				Provider:  "OPENAI-COMPATIBLE-CF WORKER",
+				AuthIndex: "AUTH-CF",
+				Model:     "@CF/ZAI-ORG/GLM-5.2",
+			},
+			rules: rules,
+			want:  "glm-5.2",
+		},
+		{
+			name: "unique provider fallback",
+			event: Event{
+				Provider:  "openai-compatible-cf worker",
+				AuthIndex: "unmapped-auth",
+				Model:     "@cf/zai-org/glm-5.2",
+			},
+			rules: []ModelAliasRule{rules[0]},
+			want:  "glm-5.2",
+		},
+		{
+			name: "conflicting provider fallback keeps upstream model",
+			event: Event{
+				Provider:  "openai-compatible-cf worker",
+				AuthIndex: "unmapped-auth",
+				Model:     "@cf/zai-org/glm-5.2",
+			},
+			rules: rules,
+			want:  "@cf/zai-org/glm-5.2",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := resolveAnalyticsModel(test.event, test.rules); got != test.want {
+				t.Fatalf("resolveAnalyticsModel() = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+func TestSQLiteStoreAnalyticsHistoricalAliasPricingAndFilters(t *testing.T) {
+	store := openTestStore(t)
+	defer store.Close()
+
+	const (
+		provider = "openai-compatible-cf worker"
+		upstream = "@cf/zai-org/glm-5.2"
+		alias    = "glm-5.2"
+	)
+	now := time.Date(2026, 7, 10, 1, 0, 0, 0, time.UTC)
+	rules := []ModelAliasRule{{
+		Provider:      provider,
+		AuthIndex:     "auth-cf",
+		UpstreamModel: upstream,
+		Alias:         alias,
+	}}
+	if err := store.UpsertModelPrice(context.Background(), ModelPrice{
+		Model:      alias,
+		InputPer1M: 10,
+	}); err != nil {
+		t.Fatalf("upsert alias price: %v", err)
+	}
+	for _, event := range []Event{
+		{
+			RequestID:         "req-historical-alias-apikey",
+			Timestamp:         now.Add(-2 * time.Minute),
+			Provider:          provider,
+			Model:             upstream,
+			AuthIndex:         "auth-cf",
+			AuthType:          "api-key",
+			CredentialKeyHash: "key-cf",
+			Tokens:            TokenUsage{InputTokens: 100, TotalTokens: 100},
+		},
+		{
+			RequestID:    "req-historical-alias-credential",
+			Timestamp:    now.Add(-time.Minute),
+			Provider:     provider,
+			Model:        upstream,
+			AuthIndex:    "auth-cf",
+			AuthFileName: "cf.json",
+			AuthType:     "oauth",
+			Tokens:       TokenUsage{InputTokens: 100, TotalTokens: 100},
+		},
+	} {
+		if _, err := store.InsertEvent(context.Background(), event); err != nil {
+			t.Fatalf("insert event: %v", err)
+		}
+	}
+
+	request := AnalyticsRequest{
+		FromMS:       now.Add(-time.Hour).UnixMilli(),
+		ToMS:         now.Add(time.Minute).UnixMilli(),
+		ModelAliases: rules,
+		Include: AnalyticsInclude{
+			Summary:         true,
+			Timeline:        true,
+			ModelStats:      true,
+			APIKeyStats:     true,
+			CredentialStats: true,
+			EventsPage:      &AnalyticsEventsPage{Limit: 10},
+		},
+	}
+	result, err := store.Analytics(context.Background(), request)
+	if err != nil {
+		t.Fatalf("analytics: %v", err)
+	}
+	if result.Events == nil || len(result.Events.Items) != 2 {
+		t.Fatalf("events = %#v", result.Events)
+	}
+	for _, item := range result.Events.Items {
+		if item.Model != alias || item.UpstreamModel != upstream || item.EstimatedCostUSD == nil {
+			t.Fatalf("event = %#v", item)
+		}
+	}
+	const wantCost = 0.002
+	if result.Summary == nil || result.Summary.TotalCost == nil || math.Abs(*result.Summary.TotalCost-wantCost) > 0.000000001 {
+		t.Fatalf("summary = %#v, want cost %v", result.Summary, wantCost)
+	}
+	if len(result.Timeline) != 1 || result.Timeline[0].Cost == nil || math.Abs(*result.Timeline[0].Cost-wantCost) > 0.000000001 {
+		t.Fatalf("timeline = %#v, want cost %v", result.Timeline, wantCost)
+	}
+	if len(result.ModelStats) != 1 || result.ModelStats[0].Model != alias || result.ModelStats[0].Cost == nil || math.Abs(*result.ModelStats[0].Cost-wantCost) > 0.000000001 {
+		t.Fatalf("model stats = %#v, want alias %q with cost %v", result.ModelStats, alias, wantCost)
+	}
+	if len(result.APIKeyStats) != 1 || result.APIKeyStats[0].Cost == nil || math.Abs(*result.APIKeyStats[0].Cost-0.001) > 0.000000001 {
+		t.Fatalf("api key stats = %#v", result.APIKeyStats)
+	}
+	if len(result.CredentialStats) != 1 || result.CredentialStats[0].Cost == nil || math.Abs(*result.CredentialStats[0].Cost-0.001) > 0.000000001 {
+		t.Fatalf("credential stats = %#v", result.CredentialStats)
+	}
+
+	for _, model := range []string{alias, upstream} {
+		t.Run("filter "+model, func(t *testing.T) {
+			filtered := request
+			filtered.Filters.Models = []string{model}
+			result, err := store.Analytics(context.Background(), filtered)
+			if err != nil {
+				t.Fatalf("analytics: %v", err)
+			}
+			if result.Events == nil || len(result.Events.Items) != 2 {
+				t.Fatalf("events = %#v, want both historical events", result.Events)
+			}
+		})
+	}
+}
+
+func TestSQLiteStoreAnalyticsAliasFilterStaysScopedInSQL(t *testing.T) {
+	where, args := buildAnalyticsWhere(AnalyticsRequest{
+		FromMS: 100,
+		ToMS:   200,
+		Filters: AnalyticsFilters{
+			Models: []string{"glm-5.2"},
+		},
+		ModelAliases: []ModelAliasRule{{
+			Provider:      "openai-compatible-cf worker",
+			AuthIndex:     "auth-cf",
+			UpstreamModel: "@cf/zai-org/glm-5.2",
+			Alias:         "glm-5.2",
+		}},
+	})
+	if !strings.Contains(where, "(model_alias COLLATE NOCASE IN (?) OR model COLLATE NOCASE IN (?,?))") {
+		t.Fatalf("where = %q", where)
+	}
+	if len(args) != 5 || args[2] != "glm-5.2" || args[3] != "glm-5.2" || args[4] != "@cf/zai-org/glm-5.2" {
+		t.Fatalf("args = %#v", args)
+	}
+}
+
 func TestSQLiteStoreAnalyticsReturnsKnownCostWhenSomeModelsAreUnpriced(t *testing.T) {
 	store := openTestStore(t)
 	defer store.Close()

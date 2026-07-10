@@ -81,10 +81,11 @@ type Event struct {
 
 // AnalyticsRequest describes a management analytics query over raw usage events.
 type AnalyticsRequest struct {
-	FromMS  int64            `json:"from_ms"`
-	ToMS    int64            `json:"to_ms"`
-	Filters AnalyticsFilters `json:"filters"`
-	Include AnalyticsInclude `json:"include"`
+	FromMS       int64            `json:"from_ms"`
+	ToMS         int64            `json:"to_ms"`
+	Filters      AnalyticsFilters `json:"filters"`
+	Include      AnalyticsInclude `json:"include"`
+	ModelAliases []ModelAliasRule `json:"-"`
 }
 
 // AnalyticsFilters scopes an analytics query.
@@ -223,6 +224,7 @@ type AnalyticsEventRow struct {
 	TimestampMS           int64      `json:"timestamp_ms"`
 	Provider              string     `json:"provider"`
 	Model                 string     `json:"model"`
+	UpstreamModel         string     `json:"upstream_model,omitempty"`
 	Endpoint              string     `json:"endpoint"`
 	AuthIndex             string     `json:"auth_index"`
 	AuthFileName          string     `json:"auth_file_name"`
