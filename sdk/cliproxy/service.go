@@ -2506,7 +2506,7 @@ func buildOpenAICompatibilityConfigModels(compat *config.OpenAICompatibility) []
 			OwnedBy:                   compat.Name,
 			Type:                      modelType,
 			DisplayName:               modelID,
-			UserDefined:               false,
+			UserDefined:               true,
 			Thinking:                  thinking,
 			SupportedInputModalities:  inputModalities,
 			SupportedOutputModalities: outputModalities,

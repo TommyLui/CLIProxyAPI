@@ -5,6 +5,9 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
+	"github.com/tidwall/gjson"
 )
 
 func TestBuildOpenAICompatibilityConfigModels_InputModalities(t *testing.T) {
@@ -56,6 +59,38 @@ func TestBuildOpenAICompatibilityConfigModels_InputModalities(t *testing.T) {
 	}
 	if len(imageModel.SupportedInputModalities) != 0 {
 		t.Fatalf("image model input modalities = %+v, want none", imageModel.SupportedInputModalities)
+	}
+}
+
+func TestBuildOpenAICompatibilityConfigModels_PreservesXHighReasoningEffort(t *testing.T) {
+	compat := &config.OpenAICompatibility{
+		Name: "opencode-go",
+		Models: []config.OpenAICompatibilityModel{
+			{Name: "upstream-deepseek-v4-flash", Alias: "deepseek-v4-flash"},
+		},
+	}
+
+	models := buildOpenAICompatibilityConfigModels(compat)
+	if len(models) != 1 {
+		t.Fatalf("model count = %d, want 1", len(models))
+	}
+	if !models[0].UserDefined {
+		t.Fatal("OpenAI-compatible config model should be user-defined")
+	}
+
+	clientID := t.Name()
+	providerKey := util.OpenAICompatibleProviderKey(compat.Name)
+	modelRegistry := registry.GetGlobalRegistry()
+	modelRegistry.RegisterClient(clientID, providerKey, models)
+	t.Cleanup(func() { modelRegistry.UnregisterClient(clientID) })
+
+	body := []byte(`{"reasoning_effort":"xhigh"}`)
+	out, err := thinking.ApplyThinking(body, "deepseek-v4-flash", "openai-response", "openai", providerKey)
+	if err != nil {
+		t.Fatalf("ApplyThinking() error = %v", err)
+	}
+	if got := gjson.GetBytes(out, "reasoning_effort").String(); got != "xhigh" {
+		t.Fatalf("reasoning_effort = %q, want xhigh; body = %s", got, out)
 	}
 }
 
