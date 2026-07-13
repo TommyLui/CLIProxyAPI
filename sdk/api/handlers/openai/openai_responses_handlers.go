@@ -13,8 +13,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"sort"
-	"strings"
 
 	"github.com/gin-gonic/gin"
 	. "github.com/router-for-me/CLIProxyAPI/v7/internal/constant"
@@ -47,11 +45,8 @@ func writeResponsesSSEChunk(w io.Writer, chunk []byte) {
 }
 
 type responsesSSEFramer struct {
-	pending              []byte
-	outputItems          map[int][]byte
-	outputOrder          []int
-	unindexedOutputItems [][]byte
-	activeOutputItemID   string
+	pending  []byte
+	repairer *responsesEventRepairer
 }
 
 func (f *responsesSSEFramer) WriteChunk(w io.Writer, chunk []byte) {
@@ -99,42 +94,34 @@ func (f *responsesSSEFramer) Flush(w io.Writer) {
 }
 
 func (f *responsesSSEFramer) writeFrame(w io.Writer, frame []byte) {
-	writeResponsesSSEChunk(w, f.repairFrame(frame))
+	for _, repaired := range f.repairFrame(frame) {
+		writeResponsesSSEChunk(w, repaired)
+	}
 }
 
-func (f *responsesSSEFramer) repairFrame(frame []byte) []byte {
+func (f *responsesSSEFramer) repairFrame(frame []byte) [][]byte {
 	payload, ok := responsesSSEDataPayload(frame)
 	if !ok || len(payload) == 0 || bytes.Equal(payload, []byte("[DONE]")) || !json.Valid(payload) {
-		return frame
+		return [][]byte{frame}
+	}
+	if f.repairer == nil {
+		f.repairer = newResponsesEventRepairer()
 	}
 
-	switch gjson.GetBytes(payload, "type").String() {
-	case "response.output_item.added":
-		f.activeOutputItemID = strings.TrimSpace(gjson.GetBytes(payload, "item.id").String())
-	case "response.output_item.done":
-		f.recordOutputItem(payload)
-		f.activeOutputItemID = ""
-	case "response.output_text.delta":
-		itemID := strings.TrimSpace(gjson.GetBytes(payload, "item_id").String())
-		if itemID != "" && itemID != f.activeOutputItemID {
-			f.activeOutputItemID = itemID
-			return append(responsesSSESyntheticMessageAdded(payload), frame...)
+	repairedPayloads := f.repairer.repair(payload)
+	frames := make([][]byte, 0, len(repairedPayloads))
+	for index, repairedPayload := range repairedPayloads {
+		if index == len(repairedPayloads)-1 {
+			if bytes.Equal(repairedPayload, payload) {
+				frames = append(frames, frame)
+			} else {
+				frames = append(frames, responsesSSEFrameWithData(frame, repairedPayload))
+			}
+			continue
 		}
-	case "response.completed":
-		f.activeOutputItemID = ""
-		repaired := f.repairCompletedPayload(payload)
-		if !bytes.Equal(repaired, payload) {
-			return responsesSSEFrameWithData(frame, repaired)
-		}
+		frames = append(frames, responsesSSEFrameWithData(nil, repairedPayload))
 	}
-	return frame
-}
-
-func responsesSSESyntheticMessageAdded(deltaPayload []byte) []byte {
-	payload := []byte(`{"type":"response.output_item.added","output_index":0,"item":{"id":"","type":"message","status":"in_progress","role":"assistant","content":[]}}`)
-	payload, _ = sjson.SetBytes(payload, "output_index", gjson.GetBytes(deltaPayload, "output_index").Int())
-	payload, _ = sjson.SetBytes(payload, "item.id", gjson.GetBytes(deltaPayload, "item_id").String())
-	return responsesSSEFrameWithData(nil, payload)
+	return frames
 }
 
 func responsesSSEDataPayload(frame []byte) ([]byte, bool) {
@@ -174,68 +161,6 @@ func responsesSSEFrameWithData(frame, payload []byte) []byte {
 	}
 	out.WriteByte('\n')
 	return out.Bytes()
-}
-
-func (f *responsesSSEFramer) recordOutputItem(payload []byte) {
-	item := gjson.GetBytes(payload, "item")
-	if !item.Exists() || !item.IsObject() || item.Get("type").String() == "" {
-		return
-	}
-
-	if outputIndex := gjson.GetBytes(payload, "output_index"); outputIndex.Exists() {
-		index := int(outputIndex.Int())
-		if f.outputItems == nil {
-			f.outputItems = make(map[int][]byte)
-		}
-		if _, exists := f.outputItems[index]; !exists {
-			f.outputOrder = append(f.outputOrder, index)
-		}
-		f.outputItems[index] = append([]byte(nil), item.Raw...)
-		return
-	}
-
-	f.unindexedOutputItems = append(f.unindexedOutputItems, append([]byte(nil), item.Raw...))
-}
-
-func (f *responsesSSEFramer) repairCompletedPayload(payload []byte) []byte {
-	if len(f.outputOrder) == 0 && len(f.unindexedOutputItems) == 0 {
-		return payload
-	}
-	output := gjson.GetBytes(payload, "response.output")
-	if output.Exists() && (!output.IsArray() || len(output.Array()) > 0) {
-		return payload
-	}
-
-	var outputJSON bytes.Buffer
-	outputJSON.WriteByte('[')
-	indexes := append([]int(nil), f.outputOrder...)
-	sort.Ints(indexes)
-	written := 0
-	for _, index := range indexes {
-		item, ok := f.outputItems[index]
-		if !ok {
-			continue
-		}
-		if written > 0 {
-			outputJSON.WriteByte(',')
-		}
-		outputJSON.Write(item)
-		written++
-	}
-	for _, item := range f.unindexedOutputItems {
-		if written > 0 {
-			outputJSON.WriteByte(',')
-		}
-		outputJSON.Write(item)
-		written++
-	}
-	outputJSON.WriteByte(']')
-
-	repaired, err := sjson.SetRawBytes(payload, "response.output", outputJSON.Bytes())
-	if err != nil {
-		return payload
-	}
-	return repaired
 }
 
 func responsesSSEFrameLen(chunk []byte) int {

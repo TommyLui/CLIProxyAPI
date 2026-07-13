@@ -170,8 +170,8 @@ func TestForwardResponsesStreamRepairsOutputTextDeltaWithoutActiveItem(t *testin
 	h.forwardResponsesStream(c, flusher, func(error) {}, data, errs, nil)
 
 	parts := strings.Split(strings.TrimSpace(recorder.Body.String()), "\n\n")
-	if len(parts) != 4 {
-		t.Fatalf("expected synthetic output_item.added before orphan text delta, got %d events. Body: %q", len(parts), recorder.Body.String())
+	if len(parts) != 5 {
+		t.Fatalf("expected synthetic item and content part before orphan text delta, got %d events. Body: %q", len(parts), recorder.Body.String())
 	}
 
 	payload, ok := responsesSSEDataPayload([]byte(parts[2]))
@@ -194,9 +194,23 @@ func TestForwardResponsesStreamRepairsOutputTextDeltaWithoutActiveItem(t *testin
 		t.Fatalf("expected synthetic assistant role, got %q in %s", got, payload)
 	}
 
-	deltaPayload, ok := responsesSSEDataPayload([]byte(parts[3]))
+	contentPayload, ok := responsesSSEDataPayload([]byte(parts[3]))
+	if !ok {
+		t.Fatalf("expected synthetic content event to contain data payload: %q", parts[3])
+	}
+	if got := gjson.GetBytes(contentPayload, "type").String(); got != "response.content_part.added" {
+		t.Fatalf("expected synthetic content_part.added, got %q in %s", got, contentPayload)
+	}
+	if got := gjson.GetBytes(contentPayload, "item_id").String(); got != "msg-1" {
+		t.Fatalf("expected synthetic content owner msg-1, got %q in %s", got, contentPayload)
+	}
+	if got := gjson.GetBytes(contentPayload, "part.type").String(); got != "output_text" {
+		t.Fatalf("expected synthetic output_text content part, got %q in %s", got, contentPayload)
+	}
+
+	deltaPayload, ok := responsesSSEDataPayload([]byte(parts[4]))
 	if !ok || gjson.GetBytes(deltaPayload, "type").String() != "response.output_text.delta" {
-		t.Fatalf("expected original text delta after synthetic item, got %q", parts[3])
+		t.Fatalf("expected original text delta after synthetic lifecycle events, got %q", parts[4])
 	}
 }
 
