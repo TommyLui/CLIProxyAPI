@@ -87,41 +87,47 @@ func TestResponsesEventRepairerSynthesizesOnlyMissingContentPart(t *testing.T) {
 
 func TestResponsesEventRepairerTracksInterleavedItemsIndependently(t *testing.T) {
 	repairer := newResponsesEventRepairer()
-	upstream := [][]byte{
-		[]byte(`{"type":"response.output_item.added","output_index":0,"item":{"id":"rs-1","type":"reasoning","summary":[]},"sequence_number":0}`),
-		[]byte(`{"type":"response.output_item.added","output_index":1,"item":{"id":"msg-1","type":"message","content":[]},"sequence_number":1}`),
-		[]byte(`{"type":"response.content_part.added","item_id":"msg-1","output_index":1,"content_index":0,"part":{"type":"output_text","text":""},"sequence_number":2}`),
-		[]byte(`{"type":"response.output_item.added","output_index":2,"item":{"id":"fc-1","type":"function_call","name":"shell","arguments":""},"sequence_number":3}`),
-		[]byte(`{"type":"response.output_text.delta","item_id":"msg-1","output_index":1,"content_index":0,"delta":"hello","sequence_number":4}`),
-		[]byte(`{"type":"response.reasoning_summary_text.delta","item_id":"rs-1","output_index":0,"summary_index":0,"delta":"thinking","sequence_number":5}`),
-		[]byte(`{"type":"response.function_call_arguments.delta","item_id":"fc-1","output_index":2,"delta":"{}","sequence_number":6}`),
+	reasoningAdded := []byte(`{"type":"response.output_item.added","output_index":0,"item":{"id":"rs-1","type":"reasoning","summary":[]},"sequence_number":0}`)
+	if got := repairer.repair(reasoningAdded); len(got) != 1 || !bytes.Equal(got[0], reasoningAdded) {
+		t.Fatalf("expected reasoning item to pass through unchanged, got %q", got)
 	}
 
-	for _, event := range upstream {
-		got := repairer.repair(event)
-		if len(got) != 1 || !bytes.Equal(got[0], event) {
-			t.Fatalf("expected interleaved upstream event to pass through unchanged, got %q for %s", got, event)
-		}
-	}
-
-	orphanMessageDelta := []byte(`{"type":"response.output_text.delta","item_id":"msg-2","output_index":3,"content_index":0,"delta":"world","sequence_number":9}`)
-	got := repairer.repair(orphanMessageDelta)
+	firstMessageDelta := []byte(`{"type":"response.output_text.delta","item_id":"msg-1","output_index":1,"content_index":0,"delta":"hello","sequence_number":3}`)
+	got := repairer.repair(firstMessageDelta)
 	assertResponsesEventTypes(t, got,
 		"response.output_item.added",
 		"response.content_part.added",
 		"response.output_text.delta",
 	)
-	if owner := gjson.GetBytes(got[0], "item.id").String(); owner != "msg-2" {
-		t.Fatalf("expected repair to target msg-2, got %q", owner)
+	if owner := gjson.GetBytes(got[0], "item.id").String(); owner != "msg-1" {
+		t.Fatalf("expected repair to target msg-1, got %q", owner)
 	}
+	if !bytes.Equal(got[2], firstMessageDelta) {
+		t.Fatalf("expected message delta to remain unchanged, got %s", got[2])
+	}
+
+	toolAdded := []byte(`{"type":"response.output_item.added","output_index":2,"item":{"id":"tool-1","type":"function_call","name":"shell","arguments":""},"sequence_number":4}`)
+	if got := repairer.repair(toolAdded); len(got) != 1 || !bytes.Equal(got[0], toolAdded) {
+		t.Fatalf("expected tool item to pass through unchanged, got %q", got)
+	}
+
+	secondMessageDelta := []byte(`{"type":"response.output_text.delta","item_id":"msg-1","output_index":1,"content_index":0,"delta":" world","sequence_number":5}`)
+	if got := repairer.repair(secondMessageDelta); len(got) != 1 || !bytes.Equal(got[0], secondMessageDelta) {
+		t.Fatalf("expected subsequent message delta to use msg-1 state only, got %q", got)
+	}
+	toolDelta := []byte(`{"type":"response.function_call_arguments.delta","item_id":"tool-1","output_index":2,"delta":"{}","sequence_number":6}`)
+	if got := repairer.repair(toolDelta); len(got) != 1 || !bytes.Equal(got[0], toolDelta) {
+		t.Fatalf("expected tool delta to pass through unchanged, got %q", got)
+	}
+
 	if repairer.state.Items["rs-1"].Type != "reasoning" {
 		t.Fatalf("reasoning item was corrupted: %#v", repairer.state.Items["rs-1"])
 	}
-	if repairer.state.Items["fc-1"].Type != "function_call" {
-		t.Fatalf("tool item was corrupted: %#v", repairer.state.Items["fc-1"])
+	if repairer.state.Items["tool-1"].Type != "function_call" {
+		t.Fatalf("tool item was corrupted: %#v", repairer.state.Items["tool-1"])
 	}
-	if repairer.state.Items["msg-1"].Type != "message" || repairer.state.Items["msg-2"].Type != "message" {
-		t.Fatalf("message items were not tracked independently: %#v", repairer.state.Items)
+	if repairer.state.Items["msg-1"].Type != "message" {
+		t.Fatalf("message item was not tracked independently: %#v", repairer.state.Items)
 	}
 }
 
@@ -129,6 +135,7 @@ func TestResponsesEventRepairerDoesNotRepeatSyntheticLifecycle(t *testing.T) {
 	repairer := newResponsesEventRepairer()
 	firstDelta := []byte(`{"type":"response.output_text.delta","item_id":"msg-1","output_index":0,"content_index":0,"delta":"hello"}`)
 	secondDelta := []byte(`{"type":"response.output_text.delta","item_id":"msg-1","output_index":0,"content_index":0,"delta":" world"}`)
+	thirdDelta := []byte(`{"type":"response.output_text.delta","item_id":"msg-1","output_index":0,"content_index":0,"delta":"!"}`)
 
 	first := repairer.repair(firstDelta)
 	assertResponsesEventTypes(t, first,
@@ -139,6 +146,78 @@ func TestResponsesEventRepairerDoesNotRepeatSyntheticLifecycle(t *testing.T) {
 	second := repairer.repair(secondDelta)
 	if len(second) != 1 || !bytes.Equal(second[0], secondDelta) {
 		t.Fatalf("expected repeated delta to pass through without duplicate lifecycle events, got %q", second)
+	}
+	third := repairer.repair(thirdDelta)
+	if len(third) != 1 || !bytes.Equal(third[0], thirdDelta) {
+		t.Fatalf("expected third delta to pass through without duplicate lifecycle events, got %q", third)
+	}
+}
+
+func TestResponsesEventRepairerResetsDoneItemBeforeSameIDDelta(t *testing.T) {
+	repairer := newResponsesEventRepairer()
+	itemAdded := []byte(`{"type":"response.output_item.added","output_index":0,"item":{"id":"msg-1","type":"message","content":[]},"sequence_number":1}`)
+	itemDone := []byte(`{"type":"response.output_item.done","output_index":0,"item":{"id":"msg-1","type":"message","status":"completed","content":[]},"sequence_number":2}`)
+	repairer.repair(itemAdded)
+	previous := repairer.state.Items["msg-1"]
+	repairer.repair(itemDone)
+	if previous == nil || !previous.Done {
+		t.Fatalf("expected original item state to be done, got %#v", previous)
+	}
+
+	delta := []byte(`{"type":"response.output_text.delta","item_id":"msg-1","output_index":1,"content_index":0,"delta":"new lifecycle","sequence_number":5}`)
+	got := repairer.repair(delta)
+	assertResponsesEventTypes(t, got,
+		"response.output_item.added",
+		"response.content_part.added",
+		"response.output_text.delta",
+	)
+	current := repairer.state.Items["msg-1"]
+	if current == nil || current == previous {
+		t.Fatalf("expected a fresh state for reused item ID, previous=%p current=%p", previous, current)
+	}
+	if !current.Added || current.Done || !current.ContentPartAdded {
+		t.Fatalf("unexpected fresh item state: %#v", current)
+	}
+	if !bytes.Equal(got[2], delta) {
+		t.Fatalf("expected original delta to remain unchanged, got %s", got[2])
+	}
+}
+
+func TestResponsesEventRepairerSyntheticSequenceFollowsObservedUpstream(t *testing.T) {
+	repairer := newResponsesEventRepairer()
+	repairer.repair([]byte(`{"type":"response.created","response":{"id":"resp-1"},"sequence_number":100}`))
+	delta := []byte(`{"type":"response.output_text.delta","item_id":"msg-1","output_index":0,"content_index":0,"delta":"hello"}`)
+
+	got := repairer.repair(delta)
+	assertResponsesEventTypes(t, got,
+		"response.output_item.added",
+		"response.content_part.added",
+		"response.output_text.delta",
+	)
+	if sequence := gjson.GetBytes(got[0], "sequence_number").Int(); sequence != 101 {
+		t.Fatalf("expected synthetic item sequence 101, got %d", sequence)
+	}
+	if sequence := gjson.GetBytes(got[1], "sequence_number").Int(); sequence != 102 {
+		t.Fatalf("expected synthetic content sequence 102, got %d", sequence)
+	}
+}
+
+func TestResponsesEventRepairerOmitsSyntheticSequenceWhenNoGapExists(t *testing.T) {
+	repairer := newResponsesEventRepairer()
+	repairer.repair([]byte(`{"type":"response.created","response":{"id":"resp-1"},"sequence_number":100}`))
+	delta := []byte(`{"type":"response.output_text.delta","item_id":"msg-1","output_index":0,"content_index":0,"delta":"hello","sequence_number":101}`)
+
+	got := repairer.repair(delta)
+	assertResponsesEventTypes(t, got,
+		"response.output_item.added",
+		"response.content_part.added",
+		"response.output_text.delta",
+	)
+	if gjson.GetBytes(got[0], "sequence_number").Exists() || gjson.GetBytes(got[1], "sequence_number").Exists() {
+		t.Fatalf("expected synthetic sequence numbers to be omitted when no ordered gap exists: %q", got[:2])
+	}
+	if !bytes.Equal(got[2], delta) {
+		t.Fatalf("expected upstream sequence to remain unchanged, got %s", got[2])
 	}
 }
 

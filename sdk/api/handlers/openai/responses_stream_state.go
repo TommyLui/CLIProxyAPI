@@ -37,6 +37,23 @@ func newResponsesStreamState() *ResponsesStreamState {
 	return &ResponsesStreamState{Items: make(map[string]*OutputItemState)}
 }
 
+func (s *ResponsesStreamState) observeEvent(payload []byte) {
+	if s == nil {
+		return
+	}
+	switch responseEventType(payload) {
+	case "response.output_item.added":
+		s.recordOutputItemAdded(payload)
+	case "response.content_part.added":
+		s.recordContentPartAdded(payload)
+	case "response.output_item.done":
+		s.recordOutputItemDone(payload)
+	case "response.completed":
+		s.close()
+	}
+	s.observeSequence(payload)
+}
+
 func (s *ResponsesStreamState) ensureItem(itemID string) *OutputItemState {
 	if s == nil {
 		return nil
@@ -55,8 +72,18 @@ func (s *ResponsesStreamState) ensureItem(itemID string) *OutputItemState {
 	return item
 }
 
+func (s *ResponsesStreamState) resetItem(itemID string) {
+	if s == nil || s.Items == nil {
+		return
+	}
+	delete(s.Items, itemID)
+}
+
 func (s *ResponsesStreamState) recordOutputItemAdded(payload []byte) {
 	itemID := gjson.GetBytes(payload, "item.id").String()
+	if item := s.Items[itemID]; item != nil && item.Done {
+		s.resetItem(itemID)
+	}
 	item := s.ensureItem(itemID)
 	if item == nil {
 		return
@@ -73,6 +100,9 @@ func (s *ResponsesStreamState) recordOutputItemAdded(payload []byte) {
 
 func (s *ResponsesStreamState) recordContentPartAdded(payload []byte) {
 	itemID := gjson.GetBytes(payload, "item_id").String()
+	if item := s.Items[itemID]; item != nil && item.Done {
+		s.resetItem(itemID)
+	}
 	item := s.ensureItem(itemID)
 	if item == nil {
 		return
@@ -137,18 +167,17 @@ func (s *ResponsesStreamState) observeSequence(payload []byte) {
 	if s == nil {
 		return
 	}
-	result := gjson.GetBytes(payload, "sequence_number")
-	if !result.Exists() {
+	sequenceNumber, ok := responseSequenceNumber(payload)
+	if !ok {
 		return
 	}
-	sequenceNumber := int(result.Int())
 	if !s.sequenceSeen || sequenceNumber > s.SequenceNumber {
 		s.SequenceNumber = sequenceNumber
 	}
 	s.sequenceSeen = true
 }
 
-func (s *ResponsesStreamState) allocateSyntheticSequences(count int, upstreamPayload []byte) []int {
+func (s *ResponsesStreamState) syntheticSequences(count int, upstreamPayload []byte) []*int {
 	if s == nil || count <= 0 {
 		return nil
 	}
@@ -157,20 +186,33 @@ func (s *ResponsesStreamState) allocateSyntheticSequences(count int, upstreamPay
 	if s.sequenceSeen {
 		start = s.SequenceNumber + 1
 	}
-	if upstreamSequence := gjson.GetBytes(upstreamPayload, "sequence_number"); upstreamSequence.Exists() {
-		candidate := int(upstreamSequence.Int()) - count
-		if candidate >= 0 && (!s.sequenceSeen || candidate > s.SequenceNumber) {
-			start = candidate
+	if upstreamSequence, ok := responseSequenceNumber(upstreamPayload); ok {
+		start = upstreamSequence - count
+		minimum := 0
+		if s.sequenceSeen {
+			minimum = s.SequenceNumber + 1
+		}
+		if start < minimum {
+			// The synthetic events must precede this upstream event. Omit their
+			// sequence numbers when no ordered integer range is available.
+			return make([]*int, count)
 		}
 	}
 
-	sequences := make([]int, count)
+	sequences := make([]*int, count)
 	for i := range sequences {
-		sequences[i] = start + i
+		sequenceNumber := start + i
+		sequences[i] = &sequenceNumber
 	}
-	s.SequenceNumber = sequences[len(sequences)-1]
-	s.sequenceSeen = true
 	return sequences
+}
+
+func responseSequenceNumber(payload []byte) (int, bool) {
+	result := gjson.GetBytes(payload, "sequence_number")
+	if !result.Exists() || result.Type != gjson.Number {
+		return 0, false
+	}
+	return int(result.Int()), true
 }
 
 func (s *ResponsesStreamState) close() {
