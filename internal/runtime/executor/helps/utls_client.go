@@ -17,6 +17,11 @@ import (
 	"golang.org/x/net/proxy"
 )
 
+const (
+	utlsHTTP2ReadIdleTimeout = 15 * time.Second
+	utlsHTTP2PingTimeout     = 15 * time.Second
+)
+
 // utlsRoundTripper implements http.RoundTripper using utls with Chrome fingerprint
 // to bypass Cloudflare's TLS fingerprinting on Anthropic domains.
 type utlsRoundTripper struct {
@@ -93,7 +98,7 @@ func (t *utlsRoundTripper) createConnection(host, addr string) (*http2.ClientCon
 		return nil, err
 	}
 
-	tr := &http2.Transport{}
+	tr := newUtlsHTTP2Transport()
 	h2Conn, err := tr.NewClientConn(tlsConn)
 	if err != nil {
 		tlsConn.Close()
@@ -101,6 +106,13 @@ func (t *utlsRoundTripper) createConnection(host, addr string) (*http2.ClientCon
 	}
 
 	return h2Conn, nil
+}
+
+func newUtlsHTTP2Transport() *http2.Transport {
+	return &http2.Transport{
+		ReadIdleTimeout: utlsHTTP2ReadIdleTimeout,
+		PingTimeout:     utlsHTTP2PingTimeout,
+	}
 }
 
 func (t *utlsRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {

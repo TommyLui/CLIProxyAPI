@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 )
 
 type utlsClientRoundTripFunc func(*http.Request) (*http.Response, error)
@@ -41,5 +42,17 @@ func TestNewUtlsHTTPClientUsesContextRoundTripperForProtectedHost(t *testing.T) 
 	}
 	if !called {
 		t.Fatal("expected context RoundTripper to handle protected host request")
+	}
+}
+
+func TestNewUtlsHTTP2TransportEnablesPingHealthCheck(t *testing.T) {
+	t.Parallel()
+
+	transport := newUtlsHTTP2Transport()
+	if transport.ReadIdleTimeout != 15*time.Second {
+		t.Fatalf("ReadIdleTimeout = %s, want 15s", transport.ReadIdleTimeout)
+	}
+	if transport.PingTimeout != 15*time.Second {
+		t.Fatalf("PingTimeout = %s, want 15s", transport.PingTimeout)
 	}
 }

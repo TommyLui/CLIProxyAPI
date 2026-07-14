@@ -2,7 +2,10 @@ package usageledger
 
 import (
 	"context"
+	"database/sql"
+	"fmt"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 )
@@ -16,6 +19,115 @@ func openTestStore(t *testing.T) *SQLiteStore {
 	return store
 }
 
+func TestOpenSQLiteConfiguresConcurrentWALConnections(t *testing.T) {
+	store := openTestStore(t)
+	defer store.Close()
+
+	if got := store.db.Stats().MaxOpenConnections; got != sqliteFileMaxOpenConns {
+		t.Fatalf("max open connections = %d, want %d", got, sqliteFileMaxOpenConns)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	connections := make([]*sql.Conn, 0, sqliteFileMaxOpenConns)
+	defer func() {
+		for _, connection := range connections {
+			_ = connection.Close()
+		}
+	}()
+
+	for i := 0; i < sqliteFileMaxOpenConns; i++ {
+		connection, err := store.db.Conn(ctx)
+		if err != nil {
+			t.Fatalf("open pooled connection %d: %v", i, err)
+		}
+		connections = append(connections, connection)
+
+		var busyTimeout int
+		if err := connection.QueryRowContext(ctx, `PRAGMA busy_timeout`).Scan(&busyTimeout); err != nil {
+			t.Fatalf("read busy timeout from connection %d: %v", i, err)
+		}
+		if busyTimeout != sqliteBusyTimeoutMS {
+			t.Fatalf("connection %d busy timeout = %d, want %d", i, busyTimeout, sqliteBusyTimeoutMS)
+		}
+
+		var journalMode string
+		if err := connection.QueryRowContext(ctx, `PRAGMA journal_mode`).Scan(&journalMode); err != nil {
+			t.Fatalf("read journal mode from connection %d: %v", i, err)
+		}
+		if journalMode != "wal" {
+			t.Fatalf("connection %d journal mode = %q, want wal", i, journalMode)
+		}
+	}
+}
+
+func TestSQLiteStoreHandlesConcurrentAnalyticsAndWrites(t *testing.T) {
+	store := openTestStore(t)
+	defer store.Close()
+
+	base := time.Date(2026, 7, 14, 8, 0, 0, 0, time.UTC)
+	for i := 0; i < 20; i++ {
+		if _, err := store.InsertEvent(context.Background(), Event{
+			RequestID: fmt.Sprintf("seed-%d", i),
+			Timestamp: base.Add(time.Duration(i) * time.Second),
+			Provider:  "codex",
+			Model:     "gpt-5.6",
+		}); err != nil {
+			t.Fatalf("seed event %d: %v", i, err)
+		}
+	}
+
+	request := AnalyticsRequest{
+		FromMS: base.Add(-time.Minute).UnixMilli(),
+		ToMS:   base.Add(time.Hour).UnixMilli(),
+		Include: AnalyticsInclude{
+			EventsPage: &AnalyticsEventsPage{Limit: 20},
+		},
+	}
+
+	const workers = 12
+	errors := make(chan error, workers)
+	var wait sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wait.Add(1)
+		go func(worker int) {
+			defer wait.Done()
+			if worker%3 == 0 {
+				_, err := store.InsertEvent(context.Background(), Event{
+					RequestID: fmt.Sprintf("concurrent-%d", worker),
+					Timestamp: base.Add(time.Duration(100+worker) * time.Second),
+					Provider:  "codex",
+					Model:     "gpt-5.6",
+				})
+				if err != nil {
+					errors <- fmt.Errorf("writer %d: %w", worker, err)
+				}
+				return
+			}
+			if _, err := store.Analytics(context.Background(), request); err != nil {
+				errors <- fmt.Errorf("reader %d: %w", worker, err)
+			}
+		}(i)
+	}
+	wait.Wait()
+	close(errors)
+	for err := range errors {
+		t.Error(err)
+	}
+}
+
+func TestOpenSQLiteKeepsPrivateInMemoryDatabaseOnOneConnection(t *testing.T) {
+	store, err := OpenSQLite(":memory:")
+	if err != nil {
+		t.Fatalf("open in-memory sqlite store: %v", err)
+	}
+	defer store.Close()
+
+	if got := store.db.Stats().MaxOpenConnections; got != 1 {
+		t.Fatalf("in-memory max open connections = %d, want 1", got)
+	}
+}
+
 func findModelPrice(prices []ModelPrice, model string) (ModelPrice, bool) {
 	for _, price := range prices {
 		if price.Model == model {
@@ -23,6 +135,76 @@ func findModelPrice(prices []ModelPrice, model string) (ModelPrice, bool) {
 		}
 	}
 	return ModelPrice{}, false
+}
+
+func TestOpenSQLiteAddsModelAliasColumn(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "usage.sqlite")
+	legacy, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open legacy sqlite database: %v", err)
+	}
+	_, err = legacy.Exec(`CREATE TABLE usage_events (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		request_id TEXT NOT NULL DEFAULT '',
+		ts_ns INTEGER NOT NULL,
+		provider TEXT NOT NULL,
+		model TEXT NOT NULL,
+		endpoint TEXT NOT NULL DEFAULT '',
+		auth_index TEXT NOT NULL DEFAULT '',
+		auth_file_name TEXT NOT NULL DEFAULT '',
+		api_key_hash TEXT NOT NULL DEFAULT '',
+		credential_key_hash TEXT NOT NULL DEFAULT '',
+		account_ref TEXT NOT NULL DEFAULT '',
+		auth_type TEXT NOT NULL DEFAULT '',
+		service_tier TEXT NOT NULL DEFAULT '',
+		reasoning_effort TEXT NOT NULL DEFAULT '',
+		status_code INTEGER NOT NULL DEFAULT 0,
+		latency_ms INTEGER NOT NULL DEFAULT 0,
+		ttft_ms INTEGER NOT NULL DEFAULT 0,
+		fail_status_code INTEGER NOT NULL DEFAULT 0,
+		fail_summary TEXT NOT NULL DEFAULT '',
+		fail_body TEXT NOT NULL DEFAULT '',
+		input_tokens INTEGER NOT NULL DEFAULT 0,
+		output_tokens INTEGER NOT NULL DEFAULT 0,
+		reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+		cached_tokens INTEGER NOT NULL DEFAULT 0,
+		cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+		cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+		total_tokens INTEGER NOT NULL DEFAULT 0,
+		failed INTEGER NOT NULL DEFAULT 0
+	)`)
+	if err != nil {
+		_ = legacy.Close()
+		t.Fatalf("create legacy usage_events: %v", err)
+	}
+	if _, err := legacy.Exec(`INSERT INTO usage_events (ts_ns, provider, model) VALUES (?, ?, ?)`, 1, "legacy", "legacy-model"); err != nil {
+		_ = legacy.Close()
+		t.Fatalf("insert legacy event: %v", err)
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatalf("close legacy sqlite database: %v", err)
+	}
+
+	store, err := OpenSQLite(path)
+	if err != nil {
+		t.Fatalf("reopen migrated sqlite database: %v", err)
+	}
+	defer store.Close()
+
+	columns, err := store.tableColumns(context.Background(), "usage_events")
+	if err != nil {
+		t.Fatalf("read usage_events columns: %v", err)
+	}
+	if !columns["model_alias"] {
+		t.Fatal("usage_events is missing model_alias")
+	}
+	var model, modelAlias string
+	if err := store.db.QueryRow(`SELECT model, model_alias FROM usage_events LIMIT 1`).Scan(&model, &modelAlias); err != nil {
+		t.Fatal(err)
+	}
+	if model != "legacy-model" || modelAlias != "" {
+		t.Fatalf("migrated model names = %q / %q", model, modelAlias)
+	}
 }
 
 func TestSQLiteStoreInsertEventUpdatesRollupsOnce(t *testing.T) {

@@ -13,7 +13,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"sort"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	. "github.com/router-for-me/CLIProxyAPI/v7/internal/constant"
@@ -46,10 +46,8 @@ func writeResponsesSSEChunk(w io.Writer, chunk []byte) {
 }
 
 type responsesSSEFramer struct {
-	pending              []byte
-	outputItems          map[int][]byte
-	outputOrder          []int
-	unindexedOutputItems [][]byte
+	pending  []byte
+	repairer *responsesEventRepairer
 }
 
 func (f *responsesSSEFramer) WriteChunk(w io.Writer, chunk []byte) {
@@ -97,25 +95,34 @@ func (f *responsesSSEFramer) Flush(w io.Writer) {
 }
 
 func (f *responsesSSEFramer) writeFrame(w io.Writer, frame []byte) {
-	writeResponsesSSEChunk(w, f.repairFrame(frame))
+	for _, repaired := range f.repairFrame(frame) {
+		writeResponsesSSEChunk(w, repaired)
+	}
 }
 
-func (f *responsesSSEFramer) repairFrame(frame []byte) []byte {
+func (f *responsesSSEFramer) repairFrame(frame []byte) [][]byte {
 	payload, ok := responsesSSEDataPayload(frame)
 	if !ok || len(payload) == 0 || bytes.Equal(payload, []byte("[DONE]")) || !json.Valid(payload) {
-		return frame
+		return [][]byte{frame}
+	}
+	if f.repairer == nil {
+		f.repairer = newResponsesEventRepairer()
 	}
 
-	switch gjson.GetBytes(payload, "type").String() {
-	case "response.output_item.done":
-		f.recordOutputItem(payload)
-	case "response.completed":
-		repaired := f.repairCompletedPayload(payload)
-		if !bytes.Equal(repaired, payload) {
-			return responsesSSEFrameWithData(frame, repaired)
+	repairedPayloads := f.repairer.repair(payload)
+	frames := make([][]byte, 0, len(repairedPayloads))
+	for index, repairedPayload := range repairedPayloads {
+		if index == len(repairedPayloads)-1 {
+			if bytes.Equal(repairedPayload, payload) {
+				frames = append(frames, frame)
+			} else {
+				frames = append(frames, responsesSSEFrameWithData(frame, repairedPayload))
+			}
+			continue
 		}
+		frames = append(frames, responsesSSEFrameWithData(nil, repairedPayload))
 	}
-	return frame
+	return frames
 }
 
 func responsesSSEDataPayload(frame []byte) ([]byte, bool) {
@@ -155,68 +162,6 @@ func responsesSSEFrameWithData(frame, payload []byte) []byte {
 	}
 	out.WriteByte('\n')
 	return out.Bytes()
-}
-
-func (f *responsesSSEFramer) recordOutputItem(payload []byte) {
-	item := gjson.GetBytes(payload, "item")
-	if !item.Exists() || !item.IsObject() || item.Get("type").String() == "" {
-		return
-	}
-
-	if outputIndex := gjson.GetBytes(payload, "output_index"); outputIndex.Exists() {
-		index := int(outputIndex.Int())
-		if f.outputItems == nil {
-			f.outputItems = make(map[int][]byte)
-		}
-		if _, exists := f.outputItems[index]; !exists {
-			f.outputOrder = append(f.outputOrder, index)
-		}
-		f.outputItems[index] = append([]byte(nil), item.Raw...)
-		return
-	}
-
-	f.unindexedOutputItems = append(f.unindexedOutputItems, append([]byte(nil), item.Raw...))
-}
-
-func (f *responsesSSEFramer) repairCompletedPayload(payload []byte) []byte {
-	if len(f.outputOrder) == 0 && len(f.unindexedOutputItems) == 0 {
-		return payload
-	}
-	output := gjson.GetBytes(payload, "response.output")
-	if output.Exists() && (!output.IsArray() || len(output.Array()) > 0) {
-		return payload
-	}
-
-	var outputJSON bytes.Buffer
-	outputJSON.WriteByte('[')
-	indexes := append([]int(nil), f.outputOrder...)
-	sort.Ints(indexes)
-	written := 0
-	for _, index := range indexes {
-		item, ok := f.outputItems[index]
-		if !ok {
-			continue
-		}
-		if written > 0 {
-			outputJSON.WriteByte(',')
-		}
-		outputJSON.Write(item)
-		written++
-	}
-	for _, item := range f.unindexedOutputItems {
-		if written > 0 {
-			outputJSON.WriteByte(',')
-		}
-		outputJSON.Write(item)
-		written++
-	}
-	outputJSON.WriteByte(']')
-
-	repaired, err := sjson.SetRawBytes(payload, "response.output", outputJSON.Bytes())
-	if err != nil {
-		return payload
-	}
-	return repaired
 }
 
 func responsesSSEFrameLen(chunk []byte) int {
@@ -485,7 +430,23 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 	// New core execution path
 	modelName := gjson.GetBytes(rawJSON, "model").String()
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
-	dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, "")
+	type streamExecutionResult struct {
+		data            <-chan []byte
+		upstreamHeaders http.Header
+		errs            <-chan *interfaces.ErrorMessage
+	}
+	// Auth selection validates the upstream stream bootstrap synchronously. Run it separately so
+	// configured downstream keep-alives can start while the first upstream payload is still pending.
+	executionChan := make(chan streamExecutionResult, 1)
+	bgCtx := context.WithValue(cliCtx, "gin", c.Copy())
+	go func() {
+		data, upstreamHeaders, errs := h.ExecuteStreamWithAuthManager(bgCtx, h.HandlerType(), modelName, rawJSON, "")
+		executionChan <- streamExecutionResult{data: data, upstreamHeaders: upstreamHeaders, errs: errs}
+	}()
+
+	var dataChan <-chan []byte
+	var upstreamHeaders http.Header
+	var errChan <-chan *interfaces.ErrorMessage
 
 	setSSEHeaders := func() {
 		c.Header("Content-Type", "text/event-stream")
@@ -494,21 +455,70 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 		c.Header("Access-Control-Allow-Origin", "*")
 	}
 	framer := &responsesSSEFramer{}
+	streamCommitted := false
+	commitStream := func() {
+		if streamCommitted {
+			return
+		}
+		setSSEHeaders()
+		handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
+		streamCommitted = true
+	}
+	writeStreamError := func(errMsg *interfaces.ErrorMessage) {
+		if errMsg == nil {
+			return
+		}
+		framer.Flush(c.Writer)
+		status := http.StatusInternalServerError
+		if errMsg.StatusCode > 0 {
+			status = errMsg.StatusCode
+		}
+		errText := http.StatusText(status)
+		if errMsg.Error != nil && errMsg.Error.Error() != "" {
+			errText = errMsg.Error.Error()
+		}
+		chunk := handlers.BuildOpenAIResponsesStreamErrorChunk(status, errText, 0)
+		_, _ = fmt.Fprintf(c.Writer, "\nevent: error\ndata: %s\n\n", string(chunk))
+	}
 
-	// Peek at the first chunk
+	keepAliveInterval := handlers.StreamingKeepAliveInterval(h.Cfg)
+	var keepAlive *time.Ticker
+	var keepAliveC <-chan time.Time
+	if keepAliveInterval > 0 {
+		keepAlive = time.NewTicker(keepAliveInterval)
+		defer keepAlive.Stop()
+		keepAliveC = keepAlive.C
+	}
+	streamInterceptorsActive := h.PluginHost != nil
+	if detector, ok := h.PluginHost.(interface{ HasStreamInterceptors() bool }); ok {
+		streamInterceptorsActive = detector.HasStreamInterceptors()
+	}
+	requiresExecutionHeaders := handlers.PassthroughHeadersEnabled(h.Cfg) || streamInterceptorsActive
+
+	// Wait for stream execution and peek at the first chunk.
 	for {
 		select {
 		case <-c.Request.Context().Done():
 			cliCancel(c.Request.Context().Err())
 			return
+		case execution := <-executionChan:
+			dataChan = execution.data
+			upstreamHeaders = execution.upstreamHeaders
+			errChan = execution.errs
+			executionChan = nil
 		case errMsg, ok := <-errChan:
 			if !ok {
 				// Err channel closed cleanly; wait for data channel.
 				errChan = nil
 				continue
 			}
-			// Upstream failed immediately. Return proper error status and JSON.
-			h.WriteErrorResponse(c, errMsg)
+			if streamCommitted {
+				writeStreamError(errMsg)
+				flusher.Flush()
+			} else {
+				// Upstream failed immediately. Return proper error status and JSON.
+				h.WriteErrorResponse(c, errMsg)
+			}
 			if errMsg != nil {
 				cliCancel(errMsg.Error)
 			} else {
@@ -518,8 +528,7 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 		case chunk, ok := <-dataChan:
 			if !ok {
 				// Stream closed without data? Send headers and done.
-				setSSEHeaders()
-				handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
+				commitStream()
 				_, _ = c.Writer.Write([]byte("\n"))
 				flusher.Flush()
 				cliCancel(nil)
@@ -527,8 +536,7 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 			}
 
 			// Success! Set headers.
-			setSSEHeaders()
-			handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
+			commitStream()
 
 			// Write first chunk logic (matching forwardResponsesStream)
 			framer.WriteChunk(c.Writer, chunk)
@@ -537,6 +545,14 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 			// Continue
 			h.forwardResponsesStream(c, flusher, func(err error) { cliCancel(err) }, dataChan, errChan, framer)
 			return
+		case <-keepAliveC:
+			// Once the response is committed, late upstream or interceptor headers cannot be added.
+			if requiresExecutionHeaders {
+				continue
+			}
+			commitStream()
+			_, _ = c.Writer.Write([]byte(": keep-alive\n\n"))
+			flusher.Flush()
 		}
 	}
 }

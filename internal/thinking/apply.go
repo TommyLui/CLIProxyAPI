@@ -441,14 +441,26 @@ func ExtractReasoningEffort(body []byte, provider, model string) string {
 	}
 
 	provider = strings.ToLower(strings.TrimSpace(provider))
-	config := extractThinkingConfig(body, provider)
-	if !hasThinkingConfig(config) {
-		switch provider {
-		case "openai-response":
-			config = extractCodexConfig(body)
-		case "openai":
+	var config ThinkingConfig
+	switch provider {
+	case "openai":
+		config = extractOpenAIConfig(body)
+		if !hasThinkingConfig(config) {
 			config = extractCodexConfig(body)
 		}
+		if !hasThinkingConfig(config) {
+			config = extractClaudeConfig(body)
+		}
+	case "openai-response":
+		config = extractCodexConfig(body)
+		if !hasThinkingConfig(config) {
+			config = extractOpenAIConfig(body)
+		}
+		if !hasThinkingConfig(config) {
+			config = extractClaudeConfig(body)
+		}
+	default:
+		config = extractThinkingConfig(body, provider)
 	}
 	return reasoningEffortFromConfig(config)
 }
@@ -464,6 +476,9 @@ func ExtractTranslatedReasoningEffort(body []byte, provider string) string {
 			config = extractCodexConfig(body)
 			if !hasThinkingConfig(config) {
 				config = extractOpenAIConfig(body)
+			}
+			if !hasThinkingConfig(config) {
+				config = extractClaudeConfig(body)
 			}
 		}
 	}
@@ -670,7 +685,10 @@ func extractInteractionsConfig(body []byte) ThinkingConfig {
 func extractOpenAIConfig(body []byte) ThinkingConfig {
 	// Check reasoning_effort (OpenAI Chat Completions format)
 	if effort := gjson.GetBytes(body, "reasoning_effort"); effort.Exists() {
-		value := effort.String()
+		value := strings.ToLower(strings.TrimSpace(effort.String()))
+		if value == "" {
+			return ThinkingConfig{}
+		}
 		if value == "none" {
 			return ThinkingConfig{Mode: ModeNone, Budget: 0}
 		}
@@ -689,7 +707,10 @@ func extractOpenAIConfig(body []byte) ThinkingConfig {
 func extractCodexConfig(body []byte) ThinkingConfig {
 	// Check reasoning.effort (Codex / OpenAI Responses API format)
 	if effort := gjson.GetBytes(body, "reasoning.effort"); effort.Exists() {
-		value := effort.String()
+		value := strings.ToLower(strings.TrimSpace(effort.String()))
+		if value == "" {
+			return ThinkingConfig{}
+		}
 		if value == "none" {
 			return ThinkingConfig{Mode: ModeNone, Budget: 0}
 		}
