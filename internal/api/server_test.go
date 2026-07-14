@@ -1279,7 +1279,6 @@ func codexClientTestPriority(raw any) int {
 
 func codexClientTestMaxTemplatePriority(t *testing.T) int {
 	t.Helper()
-
 	var payload struct {
 		Models []map[string]any `json:"models"`
 	}
