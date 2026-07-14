@@ -43,7 +43,10 @@ jobs:
             release_tag="$GITHUB_REF_NAME"
           else
             release_tag="$(bash .github/scripts/generate-fork-release-tag.sh)"
-            existing_sha="$(gh api "repos/${GH_REPO}/git/ref/tags/${release_tag}" --jq '.object.sha' 2>/dev/null || true)"
+            existing_sha=""
+            if existing_sha_value="$(gh api "repos/${GH_REPO}/git/ref/tags/${release_tag}" --jq '.object.sha' 2>/dev/null)"; then
+              existing_sha="$existing_sha_value"
+            fi
             if [[ -n "$existing_sha" && "$existing_sha" != "$release_ref" ]]; then
               echo "Release tag ${release_tag} already points to ${existing_sha}, expected ${release_ref}" >&2
               exit 1
@@ -696,7 +699,7 @@ jobs:
 
   publish-checksums:
     runs-on: ubuntu-latest
-    if: always()
+    if: ${{ always() && needs.prepare-release.result == 'success' }}
     needs:
       - prepare-release
       - build-hosted
